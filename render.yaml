@@ -1,1 +1,7 @@
-
+services:
+  - type: web
+    name: twitch-duel-api
+    env: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "node index.js"
