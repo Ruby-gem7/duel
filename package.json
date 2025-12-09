@@ -1,8 +1,12 @@
 {
-  "name": "twitch-duel-api",
+  "name": "duel-api",
   "version": "1.0.0",
-  "type": "module",
+  "main": "server.js",
+  "engines": { "node": ">=16" },
   "dependencies": {
     "express": "^4.18.2"
+  },
+  "scripts": {
+    "start": "node server.js"
   }
 }
