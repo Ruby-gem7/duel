@@ -1,110 +1,110 @@
-const express = require('express');
-const db = require('./db');
-
+const express = require("express");
 const app = express();
-const PORT = process.env.PORT || 3000;
+const port = process.env.PORT || 3000;
 
-// ========== helpers ==========
-async function ensureUser(nick) {
-  await db.query(
-    `INSERT INTO users (nick)
-     VALUES ($1)
-     ON CONFLICT (nick) DO NOTHING`,
-    [nick]
-  );
+app.use(express.json());
+
+// Активные вызовы и дуэли
+// duelRequests[from] = {
+//   to: "targetUser",
+//   timer: setTimeout(...)
+// }
+
+const duelRequests = {}; 
+const activeDuels = {}; // activeDuels[user] = opponent
+
+// Очищает вызов и отменяет таймер
+function clearRequest(from) {
+    if (duelRequests[from]) {
+        clearTimeout(duelRequests[from].timer);
+        delete duelRequests[from];
+    }
 }
 
-// ========== routes ==========
-app.get('/', (req, res) => {
-  res.send('Duel API is running');
+// Проверка: кто-то в дуэли?
+function isInDuel(user) {
+    return activeDuels[user] !== undefined;
+}
+
+// ---------- Вызов дуэли ----------
+app.get("/duel", (req, res) => {
+    const from = req.query.from?.toLowerCase();
+    const to = req.query.to?.toLowerCase();
+
+    if (!from || !to) return res.send("Ошибка: нет пользователя.");
+    if (from === to) return res.send("Ты не можешь вызвать сам себя.");
+
+    // уже в дуэли
+    if (isInDuel(from)) return res.send(`Ты уже находишься в дуэли.`);
+    if (isInDuel(to)) return res.send(`${to} уже в дуэли.`);
+
+    // у тебя уже есть активный вызов
+    if (duelRequests[from]) {
+        return res.send(`Ты уже вызвал ${duelRequests[from].to}.`);
+    }
+
+    // на игрока уже есть вызов
+    const incoming = Object.values(duelRequests).find(r => r.to === to);
+    if (incoming) return res.send(`${to} уже получили вызов и ждут ответа.`);
+
+    // создаем вызов + таймер 2 минуты
+    const timer = setTimeout(() => {
+        clearRequest(from);
+        console.log(`Вызов ${from} → ${to} автоматически отменён.`);
+    }, 2 * 60 * 1000);
+
+    duelRequests[from] = { to, timer };
+
+    res.send(`${from} вызывает ${to} на дуэль! Напишите !accept или !deny.`);
 });
 
-// create duel
-app.get('/duel', async (req, res) => {
-  const { from, to } = req.query;
-  if (!from || !to) return res.send('Invalid params');
 
-  await ensureUser(from);
-  await ensureUser(to);
+// ---------- Принятие дуэли ----------
+app.get("/accept", (req, res) => {
+    const user = req.query.from?.toLowerCase();
+    if (!user) return res.send("Ошибка.");
 
-  await db.query(`
-    INSERT INTO duels (challenger_id, challenged_id, status)
-    VALUES (
-      (SELECT id FROM users WHERE nick=$1),
-      (SELECT id FROM users WHERE nick=$2),
-      'pending'
-    )
-  `, [from, to]);
+    // ищем, кто вызвал user
+    const caller = Object.keys(duelRequests).find(from => duelRequests[from].to === user);
 
-  res.send(`⚔️ ${from} вызвал ${to} на дуэль`);
+    if (!caller) return res.send("У вас нет входящих вызовов.");
+
+    // проверяем, не в дуэли ли они
+    if (isInDuel(user) || isInDuel(caller)) {
+        clearRequest(caller);
+        return res.send("Кто-то уже в дуэли.");
+    }
+
+    // создаем дуэль
+    activeDuels[user] = caller;
+    activeDuels[caller] = user;
+
+    // убираем запрос
+    clearRequest(caller);
+
+    res.send(`${user} принял дуэль от ${caller}! Битва началась!`);
 });
 
-// accept duel + random result
-app.get('/accept', async (req, res) => {
-  const { user } = req.query;
 
-  const duelQ = await db.query(`
-    SELECT d.id, u1.nick AS a, u2.nick AS b
-    FROM duels d
-    JOIN users u1 ON d.challenger_id=u1.id
-    JOIN users u2 ON d.challenged_id=u2.id
-    WHERE u2.nick=$1 AND d.status='pending'
-    ORDER BY d.created_at DESC
-    LIMIT 1
-  `, [user]);
+// ---------- Отказ от дуэли ----------
+app.get("/deny", (req, res) => {
+    const user = req.query.from?.toLowerCase();
+    if (!user) return res.send("Ошибка.");
 
-  if (!duelQ.rows.length) return res.send('Нет дуэлей');
+    // ищем входящий вызов
+    const caller = Object.keys(duelRequests).find(from => duelRequests[from].to === user);
 
-  const duel = duelQ.rows[0];
-  const winner = Math.random() < 0.5 ? duel.a : duel.b;
-  const loser = winner === duel.a ? duel.b : duel.a;
+    if (!caller) return res.send("У вас нет вызовов для отказа.");
 
-  await db.query(`
-    UPDATE duels SET
-      status='finished',
-      winner_id=(SELECT id FROM users WHERE nick=$1),
-      loser_id=(SELECT id FROM users WHERE nick=$2),
-      finished_at=NOW()
-    WHERE id=$3
-  `, [winner, loser, duel.id]);
+    clearRequest(caller);
 
-  await db.query(`UPDATE users SET wins=wins+1, duels=duels+1 WHERE nick=$1`, [winner]);
-  await db.query(`UPDATE users SET losses=losses+1, duels=duels+1 WHERE nick=$1`, [loser]);
-
-  res.send(`🏆 Победитель: ${winner}`);
+    res.send(`${user} отказался от дуэли с ${caller}.`);
 });
 
-// stats
-app.get('/stats', async (req, res) => {
-  const { user } = req.query;
 
-  const q = await db.query(`
-    SELECT wins, losses, duels
-    FROM users WHERE nick=$1
-  `, [user]);
-
-  if (!q.rows.length) return res.send('Игрок не найден');
-
-  const s = q.rows[0];
-  res.send(`📊 ${user}: ${s.wins}W / ${s.losses}L (${s.duels})`);
+// ---------- Сервер ----------
+app.get("/", (req, res) => {
+    res.send("Duel system working.");
 });
 
-// top
-app.get('/top', async (req, res) => {
-  const q = await db.query(`
-    SELECT nick, wins
-    FROM users
-    ORDER BY wins DESC
-    LIMIT 5
-  `);
-
-  res.send(
-    q.rows.map((u, i) =>
-      `${i+1}. ${u.nick} — ${u.wins}`
-    ).join(' | ')
-  );
-});
-
-app.listen(PORT, () => {
-  console.log('Server started on port', PORT);
-});
+app.listen(port, () => console.log(`Server running on port ${port}`));
