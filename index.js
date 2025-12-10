@@ -1,74 +1,162 @@
-import express from "express";
+const express = require('express');
+const CyclicDb = require('@cyclic.sh/dynamodb');
+
 const app = express();
-app.use(express.json());
+const db = CyclicDb();
+const duels = db.collection('duels');
+const players = db.collection('players');
 
-let duels = {};      
-let rating = {};     
-let cooldown = {};   
+// ==========================
+//  HELPERS
+// ==========================
 
-const CD = 20;
+async function getOrCreatePlayer(username) {
+    username = username.toLowerCase();
+    let data = await players.get(username);
 
-function now() {
-    return Math.floor(Date.now() / 1000);
+    if (!data?.props) {
+        const newData = { wins: 0, loses: 0 };
+        await players.set(username, newData);
+        return newData;
+    }
+
+    return data.props;
 }
 
-app.get("/duel", (req, res) => {
-    let from = (req.query.from || "").toLowerCase();
-    let to = (req.query.to || "").toLowerCase();
+async function addWin(username) {
+    let p = await getOrCreatePlayer(username);
+    p.wins += 1;
+    await players.set(username, p);
+}
 
-    if (!from || !to) return res.send("Используй: !duel @имя");
-    if (from === to) return res.send(`@${from}, нельзя вызвать самого себя!`);
+async function addLose(username) {
+    let p = await getOrCreatePlayer(username);
+    p.loses += 1;
+    await players.set(username, p);
+}
 
-    if (cooldown[from] && now() - cooldown[from] < CD) {
-        let left = CD - (now() - cooldown[from]);
-        return res.send(`@${from}, подожди ${left} сек перед новой дуэлью!`);
-    }
+// ==========================
+//  ROUTES
+// ==========================
 
-    if (duels[to]) {
-        return res.send(`@${to} уже участвует в дуэли!`);
-    }
+// Вызов дуэли
+app.get('/duel', async (req, res) => {
+    const from = req.query.from?.toLowerCase();
+    const to = req.query.to?.toLowerCase();
 
-    duels[to] = from;
-    cooldown[from] = now();
+    if (!from || !to) return res.send("❌ Ошибка: укажи игрока.");
+    if (from === to) return res.send("❌ Ты не можешь вызвать на дуэль самого себя.");
 
-    res.send(`@${to}, тебя вызвал на дуэль @${from}! Напиши !accept`);
-});
-
-app.get("/accept", (req, res) => {
-    let target = (req.query.from || "").toLowerCase();
-
-    if (!duels[target]) {
-        return res.send(`@${target}, тебя никто не вызывал на дуэль.`);
-    }
-
-    let challenger = duels[target];
-    delete duels[target];
-
-    let winner = Math.random() < 0.5 ? challenger : target;
-    let loser = winner === challenger ? target : challenger;
-
-    rating[winner] = rating[winner] || { wins: 0, losses: 0 };
-    rating[loser]  = rating[loser]  || { wins: 0, losses: 0 };
-
-    rating[winner].wins++;
-    rating[loser].losses++;
-
-    res.send(`⚔️ Дуэль между @${challenger} и @${target}! 🏆 Победитель: @${winner}!`);
-});
-
-app.get("/rating", (req, res) => {
-    let list = Object.entries(rating)
-        .sort((a, b) => b[1].wins - a[1].wins)
-        .slice(0, 5);
-
-    if (list.length === 0) return res.send("Рейтинг пока пуст 😢");
-
-    let text = "🏆 Топ дуэлянтов: ";
-    list.forEach(([user, stats], i) => {
-        text += `${i+1}. ${user} (${stats.wins} побед)  `;
+    await duels.set(from, {
+        challenger: from,
+        opponent: to,
+        status: "pending",
+        time: Date.now()
     });
 
-    res.send(text);
+    res.send(`🗡️ ${from} вызывает ${to} на дуэль! Напиши !accept, чтобы принять дуэль или !deny, чтобы отказаться.`);
 });
 
-app.listen(3000, () => console.log("API started"));
+// Принять дуэль
+app.get('/accept', async (req, res) => {
+    const from = req.query.from?.toLowerCase();
+
+    if (!from) return res.send("❌ Ошибка: укажи игрока.");
+
+    // находим активную дуэль где “from” — это тот, кого вызвали
+    const all = await duels.list();
+
+    let duel = null;
+    for (const d of all.results) {
+        const data = await duels.get(d.key);
+        if (data?.props?.opponent === from && data.props.status === "pending") {
+            duel = data.props;
+            break;
+        }
+    }
+
+    if (!duel) {
+        return res.send(`❌ ${from}, у тебя нет активных вызовов на дуэль.`);
+    }
+
+    // Определяем победителя
+    const challenger = duel.challenger;
+    const opponent = duel.opponent;
+
+    const winner = Math.random() < 0.5 ? challenger : opponent;
+    const loser = winner === challenger ? opponent : challenger;
+
+    await addWin(winner);
+    await addLose(loser);
+
+    await duels.delete(challenger);
+
+    res.send(`⚔️ Дуэль: ${challenger} vs ${opponent}! Победитель — ${winner}! 🎉`);
+});
+
+// Отменить дуэль
+app.get('/deny', async (req, res) => {
+    const from = req.query.from?.toLowerCase();
+
+    if (!from) return res.send("❌ Ошибка: укажи игрока.");
+
+    const all = await duels.list();
+    for (const d of all.results) {
+        const data = await duels.get(d.key);
+        if (data?.props?.opponent === from && data.props.status === "pending") {
+            await duels.delete(d.key);
+            return res.send(`🚫 ${from} отказался от дуэли.`);
+        }
+    }
+
+    res.send(`❌ ${from}, тебе никто не бросал вызов.`);
+});
+
+// Статистика игрока
+app.get('/stats', async (req, res) => {
+    const user = req.query.user?.toLowerCase();
+    if (!user) return res.send("❌ Укажи игрока");
+
+    const data = await getOrCreatePlayer(user);
+
+    const rating = data.wins - data.loses;
+
+    res.send(`📊 Статистика ${user}: Побед: ${data.wins}, Поражений: ${data.loses}, Рейтинг: ${rating}`);
+});
+
+// Таблица рейтинга
+app.get('/top', async (req, res) => {
+    const list = await players.list();
+
+    const stats = [];
+
+    for (const p of list.results) {
+        const data = await players.get(p.key);
+        if (data?.props) {
+            const u = p.key;
+            const { wins, loses } = data.props;
+            stats.push({
+                user: u,
+                wins,
+                loses,
+                rating: wins - loses
+            });
+        }
+    }
+
+    stats.sort((a, b) => b.rating - a.rating);
+
+    const top5 = stats.slice(0, 5);
+
+    let result = "🏆 ТОП рейтинга:\n";
+    top5.forEach((p, i) => {
+        result += `${i + 1}. ${p.user} — рейтинг: ${p.rating} (W:${p.wins}/L:${p.loses})\n`;
+    });
+
+    res.send(result.trim());
+});
+
+// ==========================
+//  START SERVER
+// ==========================
+app.listen(3000, () => console.log("API is running"));
